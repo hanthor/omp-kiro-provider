@@ -11,11 +11,10 @@ const tscPath = join(root, "node_modules", "typescript", "bin", "tsc");
 function writeNodeModulesTypeScriptLoader(path) {
   writeFileSync(path, `
 import { existsSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { transformSync } from "esbuild";
 import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-const require = createRequire(import.meta.url);
-const typescript = require(${JSON.stringify(tscPath.replace(/[/\\\\]bin[/\\\\]tsc$/, ""))});
 const bunShimUrl = "data:text/javascript," + encodeURIComponent([
   "export const YAML = { parse() { return {}; }, stringify(value) { return JSON.stringify(value); } };",
   "export const JSONC = { parse() { return {}; }, stringify(value) { return JSON.stringify(value); } };",
@@ -24,11 +23,33 @@ const bunShimUrl = "data:text/javascript," + encodeURIComponent([
   "export const Database = class { constructor() { throw new Error('Bun SQLite is unavailable in Node test mode.'); } };",
   "export const FFIType = {}; export const dlopen = () => { throw new Error('Bun FFI is unavailable in Node test mode.'); }; export const ptr = () => 0;",
 ].join("\\n"));
-const nativeShimUrl = "data:text/javascript," + encodeURIComponent([
-  "export class FileLock { static tryAcquire() { return { acquired: true, release() {} }; } release() {} }",
-  "export class Process {}",
-  "export const ProcessStatus = {};",
-].join("\\n"));
+const nativeShimUrl = (() => {
+  // Bespoke behavior the suite relies on; everything else is generated below.
+  const lines = [
+    "export class FileLock { static tryAcquire() { return { acquired: true, release() {} }; } release() {} }",
+    "export class Process {}",
+    "export const ProcessStatus = {};",
+  ];
+  // Self-updating stub surface: derive every other runtime export from the installed
+  // pi-natives type surface so new upstream symbols (e.g. renderMermaidAscii) do not
+  // break Node test mode. This loader lives in the temp build dir whose node_modules
+  // symlinks back to the package root.
+  try {
+    const nativesDts = join(dirname(fileURLToPath(import.meta.url)), "node_modules", "@oh-my-pi", "pi-natives", "native", "index.d.ts");
+    const declarations = readFileSync(nativesDts, "utf8");
+    const seen = new Set(["FileLock", "Process", "ProcessStatus"]);
+    for (const match of declarations.matchAll(/export declare (class|function|const|enum) ([A-Za-z0-9_]+)/g)) {
+      const kind = match[1];
+      const name = match[2];
+      if (seen.has(name)) continue;
+      seen.add(name);
+      if (kind === "class") lines.push("export class " + name + " {}");
+      else if (kind === "function") lines.push("export const " + name + " = (...args) => { throw new Error('pi-natives." + name + " is unavailable in Node test mode.'); };");
+      else lines.push("export const " + name + " = {};");
+    }
+  } catch {}
+  return "data:text/javascript," + encodeURIComponent(lines.join("\\n"));
+})();
 
 function isBunSpecifier(specifier) {
   return specifier === "bun" || specifier.startsWith("bun:");
@@ -69,15 +90,14 @@ export async function load(url, context, nextLoad) {
   }
   if (url.endsWith(".ts") && url.includes("/node_modules/")) {
     const source = readFileSync(fileURLToPath(url), "utf8").replaceAll("import.meta.dir", JSON.stringify(fileURLToPath(new URL(".", url))));
-    const output = typescript.transpileModule(source, {
-      compilerOptions: {
-        target: typescript.ScriptTarget.ES2022,
-        module: typescript.ModuleKind.ESNext,
-        sourceMap: false,
-      },
-      fileName: url,
+    const output = transformSync(source, {
+      loader: "ts",
+      target: "es2022",
+      format: "esm",
+      sourcemap: false,
+      sourcefile: url,
     });
-    return { format: "module", source: output.outputText, shortCircuit: true };
+    return { format: "module", source: output.code, shortCircuit: true };
   }
   return nextLoad(url, context, nextLoad);
 }
